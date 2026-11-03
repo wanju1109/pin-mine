@@ -1,0 +1,920 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>금광 두더지 - Pin Mine</title>
+<style>
+html,body{margin:0;height:100%;background:#120c1f;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+body{display:flex;align-items:center;justify-content:center}
+canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script id="core">
+// 물리·레벨 생성 핵심부: 본 페이지와 생성 워커가 함께 쓴다
+var PMCore = (() => {
+'use strict';
+// ---------- 격자와 물리 ----------
+const W = 30, H = 46, CS = 12, GX = 20, GY = 82;
+const E = 0, WALL = 1, PIN = 2, GOLD = 3, WATER = 4, LAVA = 5, STONE = 6, ASH = 7;
+const CART_TOP = 37, CART_L = 7, CART_R = 22;
+const SETTLE = 40;
+let STAMP = 0;
+const mark = new Uint32Array(W * H);
+
+function makeSim(g) {
+  return { g: Uint8Array.from(g), dir: new Int8Array(W * H), tick: 0, still: 0, lavaHome: false, fx: null };
+}
+function cloneSim(s) {
+  return { g: Uint8Array.from(s.g), dir: Int8Array.from(s.dir), tick: s.tick, still: s.still, lavaHome: s.lavaHome, fx: null };
+}
+
+function step(s) {
+  const g = s.g, dir = s.dir, t = ++s.tick, st = ++STAMP;
+  let mv = 0;
+  const lr = t & 1, lavaTurn = (t & 1) === 0;
+  for (let y = H - 2; y >= 1; y--) {
+    const row = y * W;
+    for (let i = 1; i < W - 1; i++) {
+      const x = lr ? i : W - 1 - i, k = row + x, c = g[k];
+      if (c < GOLD || mark[k] === st) continue;
+      const b = k + W;
+      if (c === WATER || c === LAVA) {
+        if (c === LAVA && !lavaTurn) continue;
+        if (g[b] === E) { g[b] = c; g[k] = E; dir[b] = dir[k]; mark[b] = st; mv++; continue; }
+        let d = dir[k] || (((x + y + t) & 1) ? 1 : -1);
+        if (g[b + d] === E) { g[b + d] = c; g[k] = E; dir[b + d] = d; mark[b + d] = st; mv++; continue; }
+        if (g[b - d] === E) { g[b - d] = c; g[k] = E; dir[b - d] = -d; mark[b - d] = st; mv++; continue; }
+        const n = c === WATER ? 3 : 2;
+        let p = k, moved = 0;
+        for (let j = 0; j < n; j++) {
+          const q = p + d;
+          if (g[q] !== E) break;
+          p = q; moved++;
+          if (g[q + W] === E) break;
+        }
+        if (moved) { g[p] = c; g[k] = E; dir[p] = d; mark[p] = st; } else dir[k] = -d;
+        continue;
+      }
+      // 가루(금, 돌, 재): 액체 속으로 가라앉는다
+      const bc = g[b];
+      if (bc === E || bc === WATER || bc === LAVA) {
+        g[b] = c; g[k] = bc; dir[k] = dir[b]; mark[b] = st; mark[k] = st; mv++; continue;
+      }
+      const d = ((x + t) & 1) ? 1 : -1;
+      let q = b + d, qc = g[q];
+      if (qc === E || qc === WATER || qc === LAVA) { g[q] = c; g[k] = qc; mark[q] = st; mark[k] = st; mv++; continue; }
+      q = b - d; qc = g[q];
+      if (qc === E || qc === WATER || qc === LAVA) { g[q] = c; g[k] = qc; mark[q] = st; mark[k] = st; mv++; continue; }
+    }
+  }
+  // 반응: 용암+물 = 돌, 용암+금 = 재
+  for (let k = W; k < W * (H - 1); k++) {
+    if (g[k] !== LAVA) continue;
+    const nb = [k - W, k + W, k - 1, k + 1];
+    for (let j = 0; j < 4; j++) {
+      const n = nb[j], c = g[n];
+      if (c === GOLD) { g[n] = ASH; mv++; if (s.fx) s.fx.push(1, n); }
+      else if (c === WATER) { g[k] = STONE; g[n] = E; mv++; if (s.fx) s.fx.push(0, n); break; }
+    }
+  }
+  // 수레 바닥의 물은 빠져나간다
+  const bot = (H - 2) * W;
+  for (let x = CART_L; x <= CART_R; x++) if (g[bot + x] === WATER) { g[bot + x] = E; mv++; }
+  for (let y = CART_TOP; y <= H - 2; y++) for (let x = CART_L; x <= CART_R; x++) if (g[y * W + x] === LAVA) s.lavaHome = true;
+  s.still = mv ? 0 : s.still + 1;
+}
+
+function settle(s, max = 700) {
+  for (let i = 0; i < max; i++) {
+    step(s);
+    if (s.lavaHome || s.still >= SETTLE) return;
+  }
+}
+function goldHome(g) {
+  let n = 0;
+  for (let y = CART_TOP; y <= H - 2; y++) for (let x = CART_L; x <= CART_R; x++) if (g[y * W + x] === GOLD) n++;
+  return n;
+}
+function goldAll(g) { let n = 0; for (let k = 0; k < g.length; k++) if (g[k] === GOLD) n++; return n; }
+function removePin(g, pin) { for (const k of pin.cells) if (g[k] === PIN) g[k] = E; }
+
+// ---------- 레벨 생성 ----------
+function rngOf(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const pick = (r, a, b) => a + Math.floor(r() * (b - a + 1));
+
+function params(L) {
+  return {
+    tiers: L <= 2 ? [1, 1] : L <= 5 ? [1, 2] : L <= 11 ? [2, 2] : [2, 3],
+    rooms: L === 1 ? [1, 2] : L <= 9 ? [2, 3] : [3, 4],
+    pins: L === 1 ? [1, 2] : L === 2 ? [2, 3] : L <= 4 ? [3, 4] : L <= 9 ? [3, 5] : L <= 15 ? [4, 5] : [4, 6],
+    gold: L <= 6 ? [1, 1] : [1, 2],
+    lava: L === 1 ? [0, 0] : L <= 6 ? [1, 1] : L <= 12 ? [1, 2] : [2, 3],
+    pinFloor: 0.75,
+    vpin: L < 4 ? 0 : L < 10 ? 0.25 : 0.4,
+    maxWin: L <= 2 ? 1 : L === 3 ? 0.7 : L === 4 ? 0.6 : L <= 7 ? 0.5 : L <= 11 ? 0.35 : L <= 17 ? 0.25 : 0.15,
+    minSol: L <= 2 ? 1 : L <= 6 ? 2 : 3,
+    target: Math.min(0.85, 0.5 + L * 0.025),
+    time: L < 6 ? 0 : Math.max(25, Math.round(75 - (L - 6) * 2.5)),
+  };
+}
+
+function partition(total, c, minW, r) {
+  const extra = total - c * minW;
+  if (extra < 0) return null;
+  const ws = []; let s = 0;
+  for (let i = 0; i < c; i++) { const v = r() + 0.3; ws.push(v); s += v; }
+  const out = ws.map(v => minW + Math.floor(extra * v / s));
+  out[c - 1] += total - out.reduce((a, b) => a + b, 0);
+  return out;
+}
+
+function genCandidate(P, r) {
+  const g = new Uint8Array(W * H);
+  const pinOf = new Int8Array(W * H).fill(-1);
+  for (let x = 0; x < W; x++) { g[x] = WALL; g[(H - 1) * W + x] = WALL; }
+  for (let y = 0; y < H; y++) { g[y * W] = WALL; g[y * W + W - 1] = WALL; }
+  for (let i = 0; i < 7; i++) {
+    const y = 31 + i;
+    for (let x = 1; x <= i; x++) { g[y * W + x] = WALL; g[y * W + W - 1 - x] = WALL; }
+  }
+  for (let y = 38; y <= H - 2; y++) for (let x = 1; x <= 6; x++) { g[y * W + x] = WALL; g[y * W + W - 1 - x] = WALL; }
+
+  const T = pick(r, P.tiers[0], P.tiers[1]);
+  const floors = T === 1 ? [pick(r, 13, 17)] : T === 2 ? [pick(r, 12, 15), pick(r, 26, 29)] : [9, 19, 29];
+  const rooms = [], pins = [];
+  let top = 1;
+  for (let t = 0; t < T; t++) {
+    const floor = floors[t];
+    const c = pick(r, P.rooms[0], P.rooms[1]);
+    const widths = partition(28 - (c - 1), c, 5, r);
+    if (!widths) return null;
+    let x = 1;
+    for (let i = 0; i < c; i++) {
+      const room = { t, x0: x, x1: x + widths[i] - 1, y0: top, y1: floor - 1, floor };
+      rooms.push(room);
+      if (r() < P.pinFloor) {
+        const cells = [];
+        for (let xx = room.x0; xx <= room.x1; xx++) { const k = floor * W + xx; g[k] = PIN; cells.push(k); }
+        pins.push({ orient: 'h', x0: room.x0, x1: room.x1, y0: floor, y1: floor, cells });
+      } else {
+        for (let xx = room.x0; xx <= room.x1; xx++) g[floor * W + xx] = WALL;
+      }
+      x += widths[i];
+      if (i < c - 1) {
+        g[floor * W + x] = WALL;
+        if (r() < P.vpin) {
+          const cells = [];
+          for (let y = top; y < floor; y++) { const k = y * W + x; g[k] = PIN; cells.push(k); }
+          pins.push({ orient: 'v', x0: x, x1: x, y0: top, y1: floor - 1, cells });
+        } else {
+          for (let y = top; y < floor; y++) g[y * W + x] = WALL;
+        }
+        x++;
+      }
+    }
+    top = floor + 1;
+  }
+
+  const nG = pick(r, P.gold[0], P.gold[1]);
+  const nL = pick(r, P.lava[0], P.lava[1]);
+  let nW = nL === 0 ? 0 : Math.max(nL === 1 ? 0 : 1, nL + pick(r, -1, 1));
+  if (nG + nL > rooms.length) return null;
+  nW = Math.min(nW, rooms.length - nG - nL);
+  const order = rooms.map((_, i) => i);
+  for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+  const mats = [];
+  for (let i = 0; i < nG; i++) mats.push(GOLD);
+  for (let i = 0; i < nL; i++) mats.push(LAVA);
+  for (let i = 0; i < nW; i++) mats.push(WATER);
+  const cap = { [GOLD]: nG > 1 ? 40 : 60, [LAVA]: 36, [WATER]: 56 };
+  mats.forEach((m, i) => {
+    const room = rooms[order[i]];
+    room.mat = m;
+    const w = room.x1 - room.x0 + 1, h = room.y1 - room.y0 + 1;
+    let fr = Math.max(2, Math.min(h - 2, Math.round(h * (0.35 + r() * 0.25))));
+    fr = Math.max(1, Math.min(fr, Math.floor(cap[m] / w)));
+    for (let y = room.y1 - fr + 1; y <= room.y1; y++) for (let x = room.x0; x <= room.x1; x++) g[y * W + x] = m;
+  });
+
+  pins.sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
+  pins.forEach((p, i) => {
+    p.id = i;
+    for (const k of p.cells) pinOf[k] = i;
+    if (p.orient === 'h') p.side = (p.x0 - 1) <= (W - 2 - p.x1) ? -1 : 1;
+  });
+  const total = goldAll(g);
+  return { g, pinOf, pins, rooms, goldTotal: total, target: Math.max(1, Math.ceil(total * P.target)), lava: nL };
+}
+
+function solve(lv, budget = 2500) {
+  const n = lv.pins.length;
+  const F = [1];
+  for (let i = 1; i <= n; i++) F[i] = F[i - 1] * i;
+  let nodes = 0, wins = 0, best = null, over = false;
+  const root = makeSim(lv.g);
+  settle(root);
+  const ev = s => {
+    if (s.lavaHome) return -1;
+    // 실제 플레이는 핀을 뽑는 시점이 달라 결과가 조금 흔들리므로 여유분을 둔다
+    if (goldHome(s.g) >= lv.target + 3) return 1;
+    if (goldAll(s.g) < lv.target) return -1;
+    return 0;
+  };
+  if (ev(root) !== 0) return null;
+  (function dfs(s, used, path) {
+    for (let p = 0; p < n; p++) {
+      if (used & (1 << p)) continue;
+      if (++nodes > budget) { over = true; return; }
+      const c = cloneSim(s);
+      removePin(c.g, lv.pins[p]);
+      c.still = 0;
+      settle(c);
+      const np = path.concat(p), rem = n - np.length, e = ev(c);
+      if (e > 0) { wins += F[rem]; if (!best || np.length < best.length) best = np; }
+      else if (e === 0 && rem > 0) dfs(c, used | (1 << p), np);
+      if (over) return;
+    }
+  })(root, 0, []);
+  if (over || !best) return null;
+  return { winFrac: wins / F[n], sol: best };
+}
+
+function simpleLevel(P) {
+  // 생성에 실패했을 때 쓰는 안전한 기본 판
+  const r = rngOf(7);
+  const lv = genCandidate({ ...P, tiers: [1, 1], rooms: [1, 1], gold: [1, 1], lava: [0, 0], pinFloor: 1, vpin: 0 }, r);
+  lv.sol = [0]; lv.winFrac = 1;
+  return lv;
+}
+
+function genLevelRaw(L) {
+  const P = params(L);
+  let best = null;
+  const t0 = Date.now();
+  for (let a = 0; a < 400 && Date.now() - t0 < 4000; a++) {
+    const r = rngOf(L * 9973 + a * 131 + 17);
+    const c = genCandidate(P, r);
+    if (!c) continue;
+    if (c.pins.length < P.pins[0] || c.pins.length > P.pins[1]) continue;
+    if (c.lava < P.lava[0]) continue;
+    const res = solve(c);
+    if (!res) continue;
+    c.sol = res.sol; c.winFrac = res.winFrac;
+    const ok = res.winFrac <= P.maxWin && res.sol.length >= Math.min(P.minSol, c.pins.length);
+    if (ok) { best = c; break; }
+    if (!best || res.winFrac < best.winFrac) best = c;
+  }
+  if (!best) best = simpleLevel(P);
+  best.L = L;
+  best.time = P.time;
+  return best;
+}
+
+return {
+  W, H, CS, GX, GY, E, WALL, PIN, GOLD, WATER, LAVA, STONE, ASH, CART_TOP, CART_L, CART_R, SETTLE,
+  makeSim, cloneSim, step, settle, goldHome, goldAll, removePin, params, solve, genLevelRaw,
+};
+})();
+if (typeof window === 'undefined') {
+  self.onmessage = e => { const L = e.data; self.postMessage({ L, lv: PMCore.genLevelRaw(L) }); };
+}
+</script>
+<script>
+(() => {
+'use strict';
+const {
+  W, H, CS, GX, GY, E, WALL, PIN, GOLD, WATER, LAVA, STONE, ASH, CART_TOP, CART_L, CART_R, SETTLE,
+  makeSim, step, goldHome, goldAll, removePin, params, solve, genLevelRaw,
+} = PMCore;
+
+// ---------- 화면 ----------
+const VW = 400, VH = 720;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let scale = 1, dpr = 1;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  scale = Math.min(innerWidth / VW, innerHeight / VH);
+  cv.style.width = Math.floor(VW * scale) + 'px';
+  cv.style.height = Math.floor(VH * scale) + 'px';
+  cv.width = Math.round(VW * scale * dpr);
+  cv.height = Math.round(VH * scale * dpr);
+}
+addEventListener('resize', resize);
+resize();
+
+// 레벨 생성은 워커에서 미리 해 둔다 (워커를 못 쓰면 바로 생성)
+const levelCache = new Map(), waiting = new Map();
+let worker = null;
+try {
+  const code = document.getElementById('core').textContent;
+  worker = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+  worker.onmessage = e => {
+    const { L, lv } = e.data;
+    levelCache.set(L, lv);
+    const cbs = waiting.get(L) || [];
+    waiting.delete(L);
+    cbs.forEach(cb => cb(lv));
+  };
+  worker.onerror = () => { worker = null; };
+} catch (e) { worker = null; }
+const requested = new Set();
+function requestLevel(L, cb) {
+  if (levelCache.has(L)) { if (cb) cb(levelCache.get(L)); return; }
+  if (cb) { if (!waiting.has(L)) waiting.set(L, []); waiting.get(L).push(cb); }
+  if (requested.has(L) && worker) return;
+  requested.add(L);
+  if (worker) { worker.postMessage(L); return; }
+  setTimeout(() => {
+    if (!levelCache.has(L)) levelCache.set(L, genLevelRaw(L));
+    const cbs = waiting.get(L) || [];
+    waiting.delete(L);
+    cbs.forEach(f => f(levelCache.get(L)));
+  }, 20);
+}
+function genLevel(L) {
+  if (!levelCache.has(L)) levelCache.set(L, genLevelRaw(L));
+  return levelCache.get(L);
+}
+
+// ---------- 사운드 ----------
+let actx = null;
+function audio() {
+  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { actx = null; } }
+  if (actx && actx.state === 'suspended') actx.resume();
+}
+function beep(f, d = 0.08, type = 'square', v = 0.05, slide = 0) {
+  if (!actx) return;
+  try {
+    const o = actx.createOscillator(), gn = actx.createGain(), t = actx.currentTime;
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f + slide), t + d);
+    gn.gain.setValueAtTime(v, t); gn.gain.exponentialRampToValueAtTime(0.0001, t + d);
+    o.connect(gn); gn.connect(actx.destination); o.start(t); o.stop(t + d + 0.02);
+  } catch (e) {}
+}
+
+// ---------- 저장 ----------
+function loadBest() { try { return JSON.parse(localStorage.getItem('pinMineBest') || '{}'); } catch (e) { return {}; } }
+function saveBest(b) { try { localStorage.setItem('pinMineBest', JSON.stringify(b)); } catch (e) {} }
+let best = loadBest();
+
+// ---------- 게임 상태 ----------
+const G = {
+  state: 'title', level: 1, score: 0, hearts: 3, lv: null, sim: null, pulled: [],
+  timeLeft: 0, msg: '', gain: 0, stars: 0, shake: 0, fx: [], lastHome: 0, speed: 1,
+};
+
+function startRun() {
+  G.level = 1; G.score = 0; G.hearts = 3;
+  beginLevel();
+}
+function beginLevel() {
+  G.state = 'gen';
+  G.sim = null;
+  const L = G.level;
+  requestLevel(L, lv => {
+    if (G.state !== 'gen' || G.level !== L) return;
+    G.lv = lv;
+    layoutHandles(lv);
+    buildWallLayer(lv);
+    resetLevel();
+    requestLevel(L + 1);
+  });
+}
+function resetLevel() {
+  G.sim = makeSim(G.lv.g);
+  G.sim.fx = [];
+  G.pulled = G.lv.pins.map(() => -1);
+  G.timeLeft = G.lv.time;
+  G.fx = []; G.lastHome = 0; G.shake = 0;
+  G.state = 'play';
+  G.playStart = performance.now();
+}
+function pullPin(i) {
+  if (G.state !== 'play') return false;
+  const p = G.lv.pins[i];
+  if (!p || G.pulled[i] >= 0) return false;
+  G.pulled[i] = performance.now();
+  removePin(G.sim.g, p);
+  G.sim.still = 0;
+  beep(520, 0.07, 'triangle', 0.08, 400);
+  return true;
+}
+function winLevel() {
+  const h = goldHome(G.sim.g), tot = G.lv.goldTotal;
+  const ratio = h / tot;
+  G.stars = ratio >= 0.9 ? 3 : ratio >= (G.lv.target / tot + 1) / 2 ? 2 : 1;
+  G.gain = h * 10 + G.level * 50 + (G.lv.time ? Math.ceil(G.timeLeft) * 5 : 0) + G.stars * 50;
+  G.score += G.gain;
+  G.state = 'win';
+  G.overAt = performance.now();
+  if (G.level % 5 === 0 && G.hearts < 3) { G.hearts++; G.bonusHeart = true; } else G.bonusHeart = false;
+  [660, 880, 1100].forEach((f, i) => setTimeout(() => beep(f, 0.12, 'square', 0.05), i * 110));
+}
+function failLevel(msg) {
+  G.msg = msg;
+  G.hearts--;
+  G.shake = 12;
+  G.overAt = performance.now();
+  beep(160, 0.35, 'sawtooth', 0.06, -100);
+  if (G.hearts <= 0) {
+    G.state = 'over';
+    if (!best.score || G.score > best.score) best.score = G.score;
+    if (!best.level || G.level > best.level) best.level = G.level;
+    saveBest(best);
+  } else G.state = 'fail';
+}
+function nextLevel() { G.level++; beginLevel(); }
+
+// ---------- 갱신 ----------
+const TPS = 50;
+let acc = 0, lastT = performance.now();
+function update(dt) {
+  if (G.state === 'play' || G.state === 'win') {
+    acc += dt * G.speed;
+    let n = 0;
+    while (acc >= 1 / TPS && n < 20 * G.speed) {
+      step(G.sim); acc -= 1 / TPS; n++;
+      const s = G.sim;
+      for (let i = 0; i < s.fx.length; i += 2) {
+        const k = s.fx[i + 1];
+        if (G.fx.length < 120) G.fx.push({ t: s.fx[i], x: (k % W + 0.5) * CS, y: (Math.floor(k / W) + 0.5) * CS, life: 1, vy: -20 - Math.random() * 30, vx: (Math.random() - 0.5) * 20 });
+      }
+      if (s.fx.length && Math.random() < 0.3) beep(200 + Math.random() * 200, 0.05, 'sawtooth', 0.02);
+      s.fx.length = 0;
+      if (G.state !== 'play') continue;
+      if (s.lavaHome) { failLevel('용암이 수레에 떨어졌어요!'); break; }
+      if (s.still >= SETTLE) {
+        const h = goldHome(s.g);
+        if (h >= G.lv.target) { winLevel(); break; }
+        if (goldAll(s.g) < G.lv.target) { failLevel('금이 용암에 너무 많이 탔어요'); break; }
+        if (G.pulled.every(v => v >= 0)) { failLevel('금이 모자라요'); break; }
+      }
+    }
+    if (acc > 1) acc = 0;
+    if (G.state === 'play') {
+      const h = goldHome(G.sim.g);
+      if (h > G.lastHome && Math.random() < 0.5) beep(1200 + Math.random() * 600, 0.03, 'triangle', 0.025);
+      G.lastHome = h;
+      if (G.lv.time) {
+        G.timeLeft -= dt;
+        if (G.timeLeft <= 0) { G.timeLeft = 0; failLevel('시간이 다 됐어요'); }
+      }
+    }
+  }
+  for (const f of G.fx) { f.life -= dt * 1.2; f.y += f.vy * dt; f.x += f.vx * dt; }
+  G.fx = G.fx.filter(f => f.life > 0);
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 40);
+}
+
+// ---------- 그리기 ----------
+let wallLayer = null;
+function hash(k) { let h = k * 374761393; h = (h ^ (h >>> 13)) * 1274126177; return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+function buildWallLayer(lv) {
+  const c = document.createElement('canvas');
+  const S = 2;
+  c.width = W * CS * S; c.height = H * CS * S;
+  const x = c.getContext('2d');
+  x.scale(S, S);
+  const g = lv.g;
+  const isWall = (cx, cy) => cx < 0 || cy < 0 || cx >= W || cy >= H || g[cy * W + cx] === WALL;
+  for (let cy = 0; cy < H; cy++) for (let cx = 0; cx < W; cx++) {
+    if (!isWall(cx, cy)) continue;
+    const h = hash(cy * W + cx);
+    const l = 26 + h * 8;
+    x.fillStyle = `hsl(268,22%,${l}%)`;
+    x.fillRect(cx * CS, cy * CS, CS + 0.5, CS + 0.5);
+    if (h > 0.82) { x.fillStyle = 'rgba(160,220,255,0.35)'; x.fillRect(cx * CS + 3 + h * 4, cy * CS + 3, 2, 2); }
+    x.fillStyle = 'rgba(205,180,235,0.55)';
+    if (!isWall(cx, cy - 1)) x.fillRect(cx * CS, cy * CS, CS, 2);
+    x.fillStyle = 'rgba(0,0,0,0.35)';
+    if (!isWall(cx, cy + 1)) x.fillRect(cx * CS, cy * CS + CS - 2, CS, 2);
+    if (!isWall(cx - 1, cy)) x.fillRect(cx * CS, cy * CS, 2, CS);
+    if (!isWall(cx + 1, cy)) x.fillRect(cx * CS + CS - 2, cy * CS, 2, CS);
+  }
+  wallLayer = c;
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+function drawBackground(now) {
+  const gr = ctx.createLinearGradient(0, 0, 0, VH);
+  gr.addColorStop(0, '#231636'); gr.addColorStop(1, '#0f0a1a');
+  ctx.fillStyle = gr; ctx.fillRect(0, 0, VW, VH);
+  ctx.fillStyle = 'rgba(180,140,255,0.08)';
+  for (let i = 0; i < 26; i++) {
+    const x = (hash(i * 7) * VW), y = (hash(i * 13 + 1) * VH);
+    ctx.beginPath(); ctx.arc(x, y, 1 + hash(i) * 2, 0, 7); ctx.fill();
+  }
+}
+
+const GOLD_C = ['#ffd23f', '#f7b928', '#ffe066'];
+const WATER_C = ['#3d9bff', '#2f86ea'];
+const STONE_C = ['#80838f', '#6d717d'];
+function drawGrid(now) {
+  ctx.save();
+  ctx.translate(GX, GY);
+  ctx.fillStyle = '#1a1129';
+  ctx.fillRect(0, 0, W * CS, H * CS);
+  const g = G.sim.g, fr = Math.floor(now / 120);
+  for (let k = 0; k < g.length; k++) {
+    const c = g[k];
+    if (c < GOLD) continue;
+    const x = (k % W) * CS, y = Math.floor(k / W) * CS, h = hash(k);
+    if (c === GOLD) {
+      ctx.fillStyle = GOLD_C[(h * 3) | 0];
+      ctx.fillRect(x, y, CS + 0.5, CS + 0.5);
+      if (((k * 7 + fr) % 53) === 0) { ctx.fillStyle = '#fff'; ctx.fillRect(x + 4, y + 4, 4, 4); }
+      else { ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fillRect(x + 2, y + 2, 3, 3); }
+    } else if (c === WATER) {
+      ctx.fillStyle = WATER_C[(h * 2) | 0];
+      ctx.fillRect(x, y, CS + 0.5, CS + 0.5);
+      if (g[k - W] === E) { ctx.fillStyle = 'rgba(200,235,255,0.7)'; ctx.fillRect(x, y, CS, 3); }
+    } else if (c === LAVA) {
+      const f = Math.sin(now / 200 + h * 9);
+      ctx.fillStyle = f > 0.4 ? '#ffb22e' : f > -0.3 ? '#ff7a1a' : '#ef4a1c';
+      ctx.fillRect(x, y, CS + 0.5, CS + 0.5);
+      if (g[k - W] === E) { ctx.fillStyle = 'rgba(255,240,150,0.8)'; ctx.fillRect(x, y, CS, 2); }
+    } else if (c === STONE) {
+      ctx.fillStyle = STONE_C[(h * 2) | 0];
+      ctx.fillRect(x, y, CS + 0.5, CS + 0.5);
+      ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fillRect(x + 2, y + 2, 4, 2);
+    } else if (c === ASH) {
+      ctx.fillStyle = h > 0.5 ? '#3a3440' : '#2c2731';
+      ctx.fillRect(x, y, CS + 0.5, CS + 0.5);
+    }
+  }
+  if (wallLayer) ctx.drawImage(wallLayer, 0, 0, W * CS, H * CS);
+  drawCart(now);
+  drawMole(now);
+  drawPins(now);
+  for (const f of G.fx) {
+    ctx.globalAlpha = Math.max(0, f.life) * 0.8;
+    ctx.fillStyle = f.t === 0 ? '#dfe6f0' : '#6b6070';
+    ctx.beginPath(); ctx.arc(f.x, f.y, 3 + (1 - f.life) * 6, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function drawCart(now) {
+  const x0 = CART_L * CS - 4, x1 = (CART_R + 1) * CS + 4, y0 = 38 * CS - 6, y1 = (H - 1) * CS + 6;
+  ctx.lineWidth = 6; ctx.strokeStyle = '#8a5a2b'; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 + 4, y1); ctx.lineTo(x1 - 4, y1); ctx.lineTo(x1, y0); ctx.stroke();
+  ctx.lineWidth = 3; ctx.strokeStyle = '#c9a24a';
+  ctx.beginPath(); ctx.moveTo(x0 - 3, y0); ctx.lineTo(x0 + 8, y0); ctx.moveTo(x1 + 3, y0); ctx.lineTo(x1 - 8, y0); ctx.stroke();
+  ctx.fillStyle = '#2b2233';
+  for (const wx of [x0 + 26, x1 - 26]) {
+    ctx.beginPath(); ctx.arc(wx, y1 + 6, 9, 0, 7); ctx.fill();
+    ctx.fillStyle = '#9aa0ad'; ctx.beginPath(); ctx.arc(wx, y1 + 6, 4, 0, 7); ctx.fill(); ctx.fillStyle = '#2b2233';
+  }
+  if (G.lv) {
+    const h = goldHome(G.sim.g);
+    const ty = (CART_TOP + 1) * CS + 2;
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = 'rgba(255,230,120,0.25)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0 + 6, ty); ctx.lineTo(x1 - 6, ty); ctx.stroke(); ctx.setLineDash([]);
+    if (h >= G.lv.target) {
+      ctx.fillStyle = 'rgba(255,230,120,' + (0.25 + 0.15 * Math.sin(now / 150)) + ')';
+      ctx.fillRect(x0 + 4, y0, x1 - x0 - 8, 4);
+    }
+  }
+}
+
+function moleMood() {
+  if (G.state === 'fail' || G.state === 'over') return 'sad';
+  if (G.state === 'win') return 'happy';
+  const g = G.sim.g;
+  for (let y = 30; y < CART_TOP; y++) for (let x = 1; x < W - 1; x++) if (g[y * W + x] === LAVA) return 'scared';
+  if (goldHome(g) > 0) return 'happy';
+  return 'idle';
+}
+function drawMole(now) {
+  const cx = 3.5 * CS + 2, cy = 42 * CS;
+  const mood = moleMood();
+  const bob = Math.sin(now / 300) * 1.5 + (mood === 'happy' ? Math.abs(Math.sin(now / 120)) * -3 : 0);
+  ctx.fillStyle = '#0d0815';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 14, 30, 22, 0, Math.PI, 0); ctx.fill();
+  ctx.save();
+  ctx.translate(mood === 'scared' ? Math.sin(now / 30) * 1.5 : 0, bob);
+  ctx.fillStyle = '#7a5236';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 8, 20, 18, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#c99f7d';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 14, 12, 10, 0, 0, Math.PI * 2); ctx.fill();
+  // 안전모
+  ctx.fillStyle = '#ffcf33';
+  ctx.beginPath(); ctx.ellipse(cx, cy - 4, 19, 13, 0, Math.PI, 0); ctx.fill();
+  ctx.fillRect(cx - 22, cy - 5, 44, 4);
+  ctx.fillStyle = '#fff6c8';
+  ctx.beginPath(); ctx.arc(cx, cy - 10, 4, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,246,200,0.12)';
+  ctx.beginPath(); ctx.moveTo(cx, cy - 10); ctx.lineTo(cx + 90, cy - 70); ctx.lineTo(cx + 110, cy - 30); ctx.closePath(); ctx.fill();
+  // 눈
+  ctx.strokeStyle = '#1b1020'; ctx.fillStyle = '#1b1020'; ctx.lineWidth = 2;
+  if (mood === 'happy') {
+    for (const ex of [-7, 7]) { ctx.beginPath(); ctx.arc(cx + ex, cy + 6, 3, Math.PI, 0); ctx.stroke(); }
+  } else if (mood === 'sad') {
+    for (const ex of [-7, 7]) { ctx.beginPath(); ctx.moveTo(cx + ex - 3, cy + 4); ctx.lineTo(cx + ex + 3, cy + 8); ctx.moveTo(cx + ex + 3, cy + 4); ctx.lineTo(cx + ex - 3, cy + 8); ctx.stroke(); }
+  } else {
+    const r = mood === 'scared' ? 3.5 : 2.2;
+    for (const ex of [-7, 7]) { ctx.beginPath(); ctx.arc(cx + ex, cy + 6, r, 0, 7); ctx.fill(); }
+  }
+  ctx.fillStyle = '#ff8fa3';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 12, 4, 3, 0, 0, 7); ctx.fill();
+  if (mood === 'scared' || mood === 'sad') {
+    ctx.beginPath(); ctx.arc(cx, cy + 20, 3, 0, 7); ctx.fillStyle = '#1b1020'; ctx.fill();
+  } else {
+    ctx.beginPath(); ctx.arc(cx, cy + 16, 4, 0.2, Math.PI - 0.2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function pinGeom(p) {
+  if (p.orient === 'h') {
+    const cy = p.y0 * CS + CS / 2;
+    const a = p.x0 * CS, b = (p.x1 + 1) * CS;
+    const hx = p.side < 0 ? a - 7 : b + 7;
+    return { a, b, cy, hx, hy: cy, len: b - a };
+  }
+  const cx = p.x0 * CS + CS / 2;
+  const a = p.y0 * CS, b = (p.y1 + 1) * CS;
+  return { a, b, cx, hx: cx, hy: (p.vside || -1) < 0 ? a - 7 : b + 7, len: b - a };
+}
+// 손잡이끼리, 또는 세로 핀과 겹치지 않도록 손잡이 방향을 고른다
+function layoutHandles(lv) {
+  if (lv.handlesDone) return;
+  lv.handlesDone = true;
+  const pins = lv.pins;
+  const penalty = (i) => {
+    const gi = pinGeom(pins[i]);
+    let s = 0;
+    pins.forEach((q, j) => {
+      if (j === i) return;
+      const gj = pinGeom(q);
+      const d = Math.hypot(gi.hx - gj.hx, gi.hy - gj.hy);
+      if (d < 24) s += 24 - d;
+      if (q.orient === 'v' && Math.abs(gi.hx - gj.cx) < 14 && gi.hy > gj.a - 10 && gi.hy < gj.b + 10) s += 10;
+      if (q.orient === 'h' && Math.abs(gi.hy - gj.cy) < 14 && gi.hx > gj.a - 4 && gi.hx < gj.b + 4) s += 10;
+    });
+    return s;
+  };
+  for (let pass = 0; pass < 3; pass++) {
+    pins.forEach((p, i) => {
+      const key = p.orient === 'h' ? 'side' : 'vside';
+      const orig = p[key] || -1;
+      let bestSide = orig, bestS = Infinity;
+      for (const sd of [orig, -orig]) {
+        p[key] = sd;
+        const s = penalty(i) + (sd === orig ? 0 : 0.5);
+        if (s < bestS) { bestS = s; bestSide = sd; }
+      }
+      p[key] = bestSide;
+    });
+  }
+}
+function drawPins(now) {
+  const lv = G.lv;
+  lv.pins.forEach((p, i) => {
+    const t0 = G.pulled[i];
+    let k = 0;
+    if (t0 >= 0) { k = Math.min(1, (now - t0) / 260); if (k >= 1) return; }
+    const gm = pinGeom(p);
+    const off = k * (gm.len + 20);
+    ctx.save();
+    ctx.globalAlpha = 1 - k * 0.7;
+    if (p.orient === 'h') {
+      ctx.translate(p.side * off, 0);
+      const gr = ctx.createLinearGradient(0, gm.cy - 4, 0, gm.cy + 4);
+      gr.addColorStop(0, '#f4f6fb'); gr.addColorStop(0.5, '#b9c1d0'); gr.addColorStop(1, '#6e7787');
+      ctx.fillStyle = gr;
+      roundRect(gm.a + 1, gm.cy - 4, gm.len - 2, 8, 4); ctx.fill();
+    } else {
+      ctx.translate(0, (p.vside || -1) * off);
+      const gr = ctx.createLinearGradient(gm.cx - 4, 0, gm.cx + 4, 0);
+      gr.addColorStop(0, '#f4f6fb'); gr.addColorStop(0.5, '#b9c1d0'); gr.addColorStop(1, '#6e7787');
+      ctx.fillStyle = gr;
+      roundRect(gm.cx - 4, gm.a + 1, 8, gm.len - 2, 4); ctx.fill();
+    }
+    ctx.lineWidth = 4; ctx.strokeStyle = '#ffcf33';
+    ctx.fillStyle = '#3a2a10';
+    ctx.beginPath(); ctx.arc(gm.hx, gm.hy, 9, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#ffe9a0'; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(String(i + 1), gm.hx, gm.hy + 1);
+    ctx.restore();
+  });
+}
+
+function heart(x, y, s, on) {
+  ctx.fillStyle = on ? '#ff5a7a' : 'rgba(255,255,255,0.15)';
+  ctx.beginPath();
+  ctx.moveTo(x, y + s * 0.3);
+  ctx.bezierCurveTo(x, y, x - s * 0.5, y, x - s * 0.5, y + s * 0.3);
+  ctx.bezierCurveTo(x - s * 0.5, y + s * 0.6, x, y + s * 0.8, x, y + s);
+  ctx.bezierCurveTo(x, y + s * 0.8, x + s * 0.5, y + s * 0.6, x + s * 0.5, y + s * 0.3);
+  ctx.bezierCurveTo(x + s * 0.5, y, x, y, x, y + s * 0.3);
+  ctx.fill();
+}
+
+function drawHUD(now) {
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillText('레벨 ' + G.level, 20, 32);
+  for (let i = 0; i < 3; i++) heart(140 + i * 22, 16, 18, i < G.hearts);
+  ctx.textAlign = 'right'; ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#ffe07a';
+  ctx.fillText(G.score.toLocaleString() + '점', 380, 30);
+  if (!G.lv || !G.sim) return;
+  const h = goldHome(G.sim.g), tg = G.lv.target;
+  const bx = 20, by = 46, bw = G.lv.time ? 270 : 360, bh = 20;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)'; roundRect(bx, by, bw, bh, 10); ctx.fill();
+  const k = Math.min(1, h / tg);
+  ctx.fillStyle = k >= 1 ? '#7ee081' : '#ffcf33';
+  if (k > 0) { roundRect(bx, by, Math.max(20, bw * k), bh, 10); ctx.fill(); }
+  ctx.fillStyle = '#1b1020'; ctx.textAlign = 'center'; ctx.font = 'bold 13px sans-serif';
+  ctx.fillStyle = k > 0.45 ? '#1b1020' : '#fff';
+  ctx.fillText('금 ' + h + ' / ' + tg, bx + bw / 2, by + 15);
+  if (G.lv.time) {
+    const tl = Math.ceil(G.timeLeft);
+    ctx.fillStyle = tl <= 10 && (now / 250 | 0) % 2 ? '#ff6b6b' : '#fff';
+    ctx.font = 'bold 18px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText('⏱ ' + tl + '초', 380, 63);
+  }
+}
+
+const BTN = { x: 20, y: 650, w: 110, h: 50 };
+function drawBottom(now) {
+  // 판이 멈췄는데 아직 못 깼다면 다시 버튼을 깜빡여 알려 준다
+  const stuck = G.state === 'play' && G.sim.still > TPS * 5;
+  ctx.fillStyle = stuck ? 'rgba(255,207,51,' + (0.25 + 0.2 * Math.sin(now / 160)) + ')' : 'rgba(255,255,255,0.1)';
+  roundRect(BTN.x, BTN.y, BTN.w, BTN.h, 14); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 18px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('↺ 다시', BTN.x + BTN.w / 2, BTN.y + BTN.h / 2 + 1);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = '13px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('핀을 탭해서 뽑기', 150, 667);
+  ctx.fillText('용암은 물로 식혀 돌로!', 150, 687);
+}
+
+function panel(title, lines, btn, color = '#ffcf33') {
+  ctx.fillStyle = 'rgba(10,6,18,0.72)'; ctx.fillRect(0, 0, VW, VH);
+  ctx.fillStyle = '#2a1d3f'; roundRect(40, 210, 320, 300, 22); ctx.fill();
+  ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.stroke();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = color; ctx.font = 'bold 32px sans-serif'; ctx.fillText(title, 200, 266);
+  ctx.fillStyle = '#fff'; ctx.font = '17px sans-serif';
+  lines.forEach((l, i) => ctx.fillText(l, 200, 312 + i * 30));
+  ctx.fillStyle = color; roundRect(110, 430, 180, 54, 27); ctx.fill();
+  ctx.fillStyle = '#1b1020'; ctx.font = 'bold 20px sans-serif'; ctx.textBaseline = 'middle';
+  ctx.fillText(btn, 200, 458);
+}
+function star(x, y, r, on) {
+  ctx.fillStyle = on ? '#ffd23f' : 'rgba(255,255,255,0.15)';
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r * 0.45 : r;
+    ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+  }
+  ctx.closePath(); ctx.fill();
+}
+
+function drawTitle(now) {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#ffcf33'; ctx.font = 'bold 44px sans-serif';
+  ctx.fillText('금광 두더지', 200, 170);
+  ctx.fillStyle = '#c8b6e8'; ctx.font = 'bold 18px sans-serif';
+  ctx.fillText('PIN MINE', 200, 202);
+  // 장식: 금 더미와 핀
+  for (let i = 0; i < 40; i++) {
+    const x = 120 + (i % 10) * 16, y = 300 - Math.floor(i / 10) * 12 + Math.abs((i % 10) - 4.5) * 4;
+    ctx.fillStyle = GOLD_C[i % 3]; ctx.fillRect(x, y, 15, 11);
+  }
+  ctx.fillStyle = '#c0c8d6'; roundRect(100, 322, 200, 9, 4); ctx.fill();
+  ctx.lineWidth = 4; ctx.strokeStyle = '#ffcf33'; ctx.beginPath(); ctx.arc(310, 326, 10, 0, 7); ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.font = '17px sans-serif';
+  ['핀을 뽑아 금을 수레에 담으세요.', '용암이 수레에 닿으면 실패!', '물을 부으면 용암이 돌로 굳어요.', '금이 용암에 닿으면 재가 돼요.'].forEach((l, i) => ctx.fillText(l, 200, 390 + i * 28));
+  ctx.fillStyle = '#ffcf33'; roundRect(100, 520, 200, 60, 30); ctx.fill();
+  ctx.fillStyle = '#1b1020'; ctx.font = 'bold 22px sans-serif'; ctx.textBaseline = 'middle';
+  ctx.fillText('▶ 시작', 200, 551);
+  ctx.textBaseline = 'alphabetic';
+  if (best.level) {
+    ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.font = '14px sans-serif';
+    ctx.fillText('최고 기록: 레벨 ' + best.level + ' · ' + (best.score || 0).toLocaleString() + '점', 200, 618);
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.font = '12px sans-serif';
+  ctx.fillText('PC: 숫자키로 핀 뽑기 · R 다시 · Enter 확인', 200, 690);
+}
+
+function render(now) {
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+  drawBackground(now);
+  if (G.state === 'title') { drawTitle(now); return; }
+  if (G.state === 'gen' || !G.sim) {
+    drawHUD(now);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 26px sans-serif';
+    ctx.fillText('레벨 ' + G.level, 200, 330);
+    ctx.font = '16px sans-serif'; ctx.fillStyle = '#c8b6e8';
+    ctx.fillText('갱도를 파는 중…', 200, 362);
+    return;
+  }
+  ctx.save();
+  if (G.shake > 0) ctx.translate((Math.random() - 0.5) * G.shake, (Math.random() - 0.5) * G.shake);
+  drawHUD(now);
+  drawGrid(now);
+  drawBottom(now);
+  ctx.restore();
+  const since = now - (G.overAt || 0);
+  if (G.state === 'win' && since > 500) {
+    panel('레벨 클리어!', ['', '+' + G.gain.toLocaleString() + '점', G.bonusHeart ? '하트 1개 회복!' : ''], '다음 레벨 ▶', '#7ee081');
+    for (let i = 0; i < 3; i++) star(140 + i * 60, 300, 22, i < G.stars);
+  } else if (G.state === 'fail' && since > 600) {
+    panel('실패', [G.msg, '남은 하트 ' + G.hearts + '개'], '다시 도전', '#ff8a5c');
+  } else if (G.state === 'over' && since > 600) {
+    panel('게임 오버', [G.msg, '레벨 ' + G.level + ' · ' + G.score.toLocaleString() + '점', '최고: 레벨 ' + best.level + ' · ' + best.score.toLocaleString() + '점'], '처음부터', '#ff6b6b');
+  }
+}
+
+// ---------- 입력 ----------
+function toLogical(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * VW, y: (e.clientY - r.top) / r.height * VH };
+}
+function pinAt(px, py) {
+  const x = px - GX, y = py - GY;
+  let bi = -1, bd = 1e9;
+  G.lv.pins.forEach((p, i) => {
+    if (G.pulled[i] >= 0) return;
+    const gm = pinGeom(p);
+    let d;
+    if (p.orient === 'h') {
+      const dx = x < gm.a ? gm.a - x : x > gm.b ? x - gm.b : 0;
+      d = Math.hypot(dx, y - gm.cy);
+    } else {
+      const dy = y < gm.a ? gm.a - y : y > gm.b ? y - gm.b : 0;
+      d = Math.hypot(x - gm.cx, dy);
+    }
+    d = Math.min(d, Math.hypot(x - gm.hx, y - gm.hy) - 4);
+    if (d < bd) { bd = d; bi = i; }
+  });
+  return bd <= 18 ? bi : -1;
+}
+function confirmOverlay() {
+  const since = performance.now() - (G.overAt || 0);
+  if (G.state === 'title') { startRun(); return true; }
+  if (G.state === 'win' && since > 500) { nextLevel(); return true; }
+  if (G.state === 'fail' && since > 600) { resetLevel(); return true; }
+  if (G.state === 'over' && since > 600) { startRun(); return true; }
+  return false;
+}
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  audio();
+  const p = toLogical(e);
+  if (G.state !== 'play') { confirmOverlay(); return; }
+  if (p.x >= BTN.x && p.x <= BTN.x + BTN.w && p.y >= BTN.y && p.y <= BTN.y + BTN.h) { resetLevel(); return; }
+  const i = pinAt(p.x, p.y);
+  if (i >= 0) pullPin(i);
+});
+addEventListener('keydown', e => {
+  audio();
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); confirmOverlay(); return; }
+  if (G.state !== 'play') return;
+  if (e.key === 'r' || e.key === 'R') { resetLevel(); return; }
+  const n = parseInt(e.key, 10);
+  if (n >= 1 && n <= 9) pullPin(n - 1);
+});
+
+// ---------- 루프 ----------
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  if (!document.hidden) update(dt);
+  render(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+requestLevel(1);
+
+// 자동 테스트용 접근점
+window.PinMine = {
+  G, params, genLevel, solve, pullPin, startRun, nextLevel, resetLevel, confirmOverlay,
+  goldHome: () => goldHome(G.sim.g),
+  advance: (sec) => { for (let t = 0; t < sec; t += 1 / 60) update(1 / 60); },
+};
+})();
+</script>
+</body>
+</html>
