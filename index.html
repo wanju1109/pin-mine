@@ -5,13 +5,13 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>금광 두더지 - Pin Mine</title>
 <style>
-html,body{margin:0;height:100%;background:#120c1f;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#07191c;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
 body{display:flex;align-items:center;justify-content:center}
 canvas{display:block;touch-action:none}
 </style>
 </head>
 <body>
-<canvas id="c"></canvas>
+<canvas id="c" tabindex="0" aria-label="금광 두더지. Enter 시작, 숫자키 핀 뽑기, Z 되돌리기, H 힌트, R 다시."></canvas>
 <script id="core">
 // 물리·레벨 생성 핵심부: 본 페이지와 생성 워커가 함께 쓴다
 var PMCore = (() => {
@@ -259,7 +259,48 @@ function simpleLevel(P) {
   return lv;
 }
 
+function openingLevel(L) {
+  const base = simpleLevel(params(L)), g = base.g;
+  for (let y=1;y<31;y++) for(let x=1;x<29;x++) g[y*W+x]=E;
+  const pins=[], rooms=[];
+  const fill=(x0,x1,y0,y1,m)=>{for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++)g[y*W+x]=m;};
+  const pin=(x0,x1,y)=>{
+    const cells=[];for(let x=x0;x<=x1;x++){g[y*W+x]=PIN;cells.push(y*W+x);}
+    pins.push({id:pins.length,orient:'h',x0,x1,y0:y,y1:y,cells,side:x0<10?-1:1});
+  };
+  if(L===1){
+    fill(1,28,1,15,WALL); fill(7,22,3,14,E);fill(7,22,12,14,GOLD);
+    pin(7,22,15);pin(1,28,27);
+    rooms.push({x0:7,x1:22,y0:3,y1:14,mat:GOLD});
+  }else{
+    const split=L===3?10:15, floor=L===4?15:13;
+    fill(split,split,1,floor,WALL);
+    fill(1,split-1,floor-3,floor-1,GOLD);
+    fill(split+1,28,floor-6,floor-1,WATER);
+    pin(1,split-1,floor);pin(split+1,28,floor);
+    fill(1,28,25,25,LAVA);pin(1,28,26);
+    rooms.push({x0:1,x1:split-1,y0:1,y1:floor-1,mat:GOLD},{x0:split+1,x1:28,y0:1,y1:floor-1,mat:WATER});
+    if(L===3){ // Two lower gates make the safe exit a separate decision.
+      pins.pop();fill(1,28,26,26,WALL);pin(1,14,26);pin(16,28,26);
+    }
+    if(L===4){ // A sealed side pocket: leave its red pin alone.
+      fill(23,23,17,24,WALL);fill(24,28,17,17,WALL);fill(24,28,18,20,LAVA);
+      pin(24,28,24);
+    }
+  }
+  const pinOf=new Int8Array(W*H).fill(-1);
+  pins.forEach((p,i)=>{p.id=i;p.cells.forEach(k=>pinOf[k]=i);});
+  const lv={g,pinOf,pins,rooms,goldTotal:goldAll(g),target:Math.ceil(goldAll(g)*0.72),L,time:0};
+  const res=solve(lv);
+  if(!res) return null;
+  Object.assign(lv,res);
+  lv.name=['','첫 금맥','물을 먼저!','출구는 두 갈래','숨은 용암'][L];
+  lv.tip=['','위의 금을 내리고, 아래 문을 열어요','물을 먼저 부어 용암을 식혀 보세요','모든 핀을 뽑을 필요는 없어요','작은 방의 용암도 물이 흐를 때 식혀요'][L];
+  return lv;
+}
+
 function genLevelRaw(L) {
+  if(L<=4){const lv=openingLevel(L);if(lv)return lv;}
   const P = params(L);
   let best = null;
   const t0 = Date.now();
@@ -296,7 +337,7 @@ if (typeof window === 'undefined') {
 'use strict';
 const {
   W, H, CS, GX, GY, E, WALL, PIN, GOLD, WATER, LAVA, STONE, ASH, CART_TOP, CART_L, CART_R, SETTLE,
-  makeSim, step, goldHome, goldAll, removePin, params, solve, genLevelRaw,
+  makeSim, cloneSim, step, goldHome, goldAll, removePin, params, solve, genLevelRaw,
 } = PMCore;
 
 // ---------- 화면 ----------
@@ -349,13 +390,14 @@ function genLevel(L) {
 }
 
 // ---------- 사운드 ----------
-let actx = null;
+let actx = null, muted = false;
+function vibrate(ms){try{if(navigator.vibrate)navigator.vibrate(ms);}catch(e){}}
 function audio() {
   if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { actx = null; } }
   if (actx && actx.state === 'suspended') actx.resume();
 }
 function beep(f, d = 0.08, type = 'square', v = 0.05, slide = 0) {
-  if (!actx) return;
+  if (!actx || muted) return;
   try {
     const o = actx.createOscillator(), gn = actx.createGain(), t = actx.currentTime;
     o.type = type; o.frequency.setValueAtTime(f, t);
@@ -373,11 +415,12 @@ let best = loadBest();
 // ---------- 게임 상태 ----------
 const G = {
   state: 'title', level: 1, score: 0, hearts: 3, lv: null, sim: null, pulled: [],
+  streak: 0, history: [], hint: -1, hintLife: 0, toast: '', toastLife: 0, assisted: false, elapsed: 0, spark: [], reward: 0,
   timeLeft: 0, msg: '', gain: 0, stars: 0, shake: 0, fx: [], lastHome: 0, speed: 1,
 };
 
 function startRun() {
-  G.level = 1; G.score = 0; G.hearts = 3;
+  G.level = 1; G.score = 0; G.hearts = 3; G.streak = 0;
   beginLevel();
 }
 function beginLevel() {
@@ -398,7 +441,7 @@ function resetLevel() {
   G.sim.fx = [];
   G.pulled = G.lv.pins.map(() => -1);
   G.timeLeft = G.lv.time;
-  G.fx = []; G.lastHome = 0; G.shake = 0;
+  G.fx = []; G.lastHome = 0; G.shake = 0; G.history=[]; G.hint=-1; G.hintLife=0; G.assisted=false; G.elapsed=0; G.spark=[]; G.toast=G.lv.tip || '금은 수레로, 용암은 물로!'; G.toastLife=5; acc=0;
   G.state = 'play';
   G.playStart = performance.now();
 }
@@ -406,18 +449,46 @@ function pullPin(i) {
   if (G.state !== 'play') return false;
   const p = G.lv.pins[i];
   if (!p || G.pulled[i] >= 0) return false;
+  G.history.push({sim:cloneSim(G.sim),pulled:G.pulled.slice(),timeLeft:G.timeLeft,hearts:G.hearts,streak:G.streak});
+  G.hint=-1; G.hintLife=0;
   G.pulled[i] = performance.now();
+  vibrate(12);
   removePin(G.sim.g, p);
   G.sim.still = 0;
   beep(520, 0.07, 'triangle', 0.08, 400);
   return true;
+}
+function toast(msg){G.toast=msg;G.toastLife=3;}
+function undoMove(){
+  if(!['play','fail','over'].includes(G.state)||!G.history.length)return false;
+  const h=G.history.pop();G.sim=cloneSim(h.sim);G.sim.fx=[];G.pulled=h.pulled;
+  G.timeLeft=h.timeLeft;G.hearts=h.hearts;G.streak=h.streak;G.state='play';G.shake=0;
+  G.lastHome=goldHome(G.sim.g);G.fx=[];G.spark=[];G.hint=-1;G.hintLife=0;G.assisted=true;acc=0;
+  toast('한 수 전으로! 다른 순서를 생각해 보세요');beep(440,.12,'triangle');return true;
+}
+function showHint(){
+  if(G.state!=='play')return;
+  if(G.sim.still<SETTLE){toast('재료가 멈추면 힌트를 볼 수 있어요');return;}
+  const live={...G.lv,g:G.sim.g,pins:G.lv.pins.filter((p,i)=>G.pulled[i]<0)};
+  const res=solve(live);
+  G.assisted=true;
+  if(res&&res.sol.length){G.hint=G.lv.pins.indexOf(live.pins[res.sol[0]]);G.hintLife=6;toast('빛나는 '+(G.hint+1)+'번 핀을 뽑아 보세요');}
+  else toast('이 순서는 막혔어요. 한 수 되돌려 보세요');
+}
+function burst(x,y,n=12){
+  n=Math.min(n,220-G.spark.length);
+  for(let i=0;i<n;i++){const a=Math.random()*Math.PI*2,v=35+Math.random()*95;G.spark.push({x,y,vx:Math.cos(a)*v,vy:Math.sin(a)*v-40,life:1,color:['#ffe7a0','#ffd05a','#5ee3ca'][i%3]});}
 }
 function winLevel() {
   const h = goldHome(G.sim.g), tot = G.lv.goldTotal;
   const ratio = h / tot;
   G.stars = ratio >= 0.9 ? 3 : ratio >= (G.lv.target / tot + 1) / 2 ? 2 : 1;
   G.gain = h * 10 + G.level * 50 + (G.lv.time ? Math.ceil(G.timeLeft) * 5 : 0) + G.stars * 50;
+  G.streak=G.assisted?0:G.streak+1;
+  G.reward=G.streak>1?Math.min(G.streak,5)*100:0;G.gain+=G.reward;
   G.score += G.gain;
+  best.score=Math.max(best.score||0,G.score);best.level=Math.max(best.level||0,G.level);saveBest(best);
+  burst(200,350,65);vibrate([25,40,40]);
   G.state = 'win';
   G.overAt = performance.now();
   if (G.level % 5 === 0 && G.hearts < 3) { G.hearts++; G.bonusHeart = true; } else G.bonusHeart = false;
@@ -425,7 +496,7 @@ function winLevel() {
 }
 function failLevel(msg) {
   G.msg = msg;
-  G.hearts--;
+  G.hearts--; G.streak=0; vibrate([50,30,50]);
   G.shake = 12;
   G.overAt = performance.now();
   beep(160, 0.35, 'sawtooth', 0.06, -100);
@@ -442,6 +513,9 @@ function nextLevel() { G.level++; beginLevel(); }
 const TPS = 50;
 let acc = 0, lastT = performance.now();
 function update(dt) {
+  G.toastLife=Math.max(0,G.toastLife-dt);G.hintLife=Math.max(0,G.hintLife-dt);
+  if(G.state==='play')G.elapsed+=dt;
+  for(const f of G.spark){f.life-=dt;f.x+=f.vx*dt;f.y+=f.vy*dt;f.vy+=160*dt;}G.spark=G.spark.filter(f=>f.life>0);
   if (G.state === 'play' || G.state === 'win') {
     acc += dt * G.speed;
     let n = 0;
@@ -467,6 +541,7 @@ function update(dt) {
     if (G.state === 'play') {
       const h = goldHome(G.sim.g);
       if (h > G.lastHome && Math.random() < 0.5) beep(1200 + Math.random() * 600, 0.03, 'triangle', 0.025);
+      if(h>G.lastHome){burst(GX+(CART_L+Math.random()*(CART_R-CART_L))*CS,GY+39*CS,Math.min(6,h-G.lastHome));}
       G.lastHome = h;
       if (G.lv.time) {
         G.timeLeft -= dt;
@@ -493,11 +568,11 @@ function buildWallLayer(lv) {
   for (let cy = 0; cy < H; cy++) for (let cx = 0; cx < W; cx++) {
     if (!isWall(cx, cy)) continue;
     const h = hash(cy * W + cx);
-    const l = 26 + h * 8;
-    x.fillStyle = `hsl(268,22%,${l}%)`;
+    const l = 20 + h * 7;
+    x.fillStyle = `hsl(180,21%,${l}%)`;
     x.fillRect(cx * CS, cy * CS, CS + 0.5, CS + 0.5);
     if (h > 0.82) { x.fillStyle = 'rgba(160,220,255,0.35)'; x.fillRect(cx * CS + 3 + h * 4, cy * CS + 3, 2, 2); }
-    x.fillStyle = 'rgba(205,180,235,0.55)';
+    x.fillStyle = 'rgba(145,194,174,0.35)';
     if (!isWall(cx, cy - 1)) x.fillRect(cx * CS, cy * CS, CS, 2);
     x.fillStyle = 'rgba(0,0,0,0.35)';
     if (!isWall(cx, cy + 1)) x.fillRect(cx * CS, cy * CS + CS - 2, CS, 2);
@@ -514,32 +589,42 @@ function roundRect(x, y, w, h, r) {
 }
 
 function drawBackground(now) {
-  const gr = ctx.createLinearGradient(0, 0, 0, VH);
-  gr.addColorStop(0, '#231636'); gr.addColorStop(1, '#0f0a1a');
-  ctx.fillStyle = gr; ctx.fillRect(0, 0, VW, VH);
-  ctx.fillStyle = 'rgba(180,140,255,0.08)';
-  for (let i = 0; i < 26; i++) {
-    const x = (hash(i * 7) * VW), y = (hash(i * 13 + 1) * VH);
-    ctx.beginPath(); ctx.arc(x, y, 1 + hash(i) * 2, 0, 7); ctx.fill();
+  const gr=ctx.createLinearGradient(0,0,400,720);gr.addColorStop(0,'#15383b');gr.addColorStop(.5,'#0a2228');gr.addColorStop(1,'#07171c');
+  ctx.fillStyle=gr;ctx.fillRect(0,0,400,720);
+  for(let i=0;i<24;i++){
+    const x=hash(i*17)*400,y=(hash(i*11)*800-now*.006*(1+hash(i)))%800;
+    ctx.globalAlpha=.15+.2*Math.sin(now/900+i);ctx.fillStyle='#ffdc87';ctx.beginPath();ctx.arc(x,y,1+hash(i)*1.5,0,7);ctx.fill();
+  }ctx.globalAlpha=1;
+  // Timber frame, brass bolts and lantern pools give the mine depth.
+  for(const x of [5,383]){
+    ctx.fillStyle='#493a2d';roundRect(x,78,12,560,5);ctx.fill();ctx.fillStyle='#8d7350';ctx.fillRect(x+2,84,2,545);
+    for(const y of [93,270,455,620]){ctx.fillStyle='#d3ac65';ctx.beginPath();ctx.arc(x+6,y,2,0,7);ctx.fill();}
+  }
+  if(G.state==='title'){
+    const glow=ctx.createRadialGradient(200,325,10,200,325,185);glow.addColorStop(0,'#3b665344');glow.addColorStop(1,'#15383b00');ctx.fillStyle=glow;ctx.fillRect(15,140,370,380);
   }
 }
+const GOLD_C=['#f6bc43','#e6a62f','#ffe28b'];
+const WATER_C=['#299cce','#258cbf'];
+const STONE_C=['#71878b','#5b7279'];
 
-const GOLD_C = ['#ffd23f', '#f7b928', '#ffe066'];
-const WATER_C = ['#3d9bff', '#2f86ea'];
-const STONE_C = ['#80838f', '#6d717d'];
+
 function drawGrid(now) {
   ctx.save();
   ctx.translate(GX, GY);
-  ctx.fillStyle = '#1a1129';
-  ctx.fillRect(0, 0, W * CS, H * CS);
+  ctx.fillStyle = '#091d23';
+  roundRect(0,0,W*CS,H*CS,10);ctx.fill();
+  ctx.strokeStyle='#75b3a015';ctx.lineWidth=1;
+  for(let y=24;y<H*CS;y+=24){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W*CS,y);ctx.stroke();}
   const g = G.sim.g, fr = Math.floor(now / 120);
   for (let k = 0; k < g.length; k++) {
     const c = g[k];
     if (c < GOLD) continue;
     const x = (k % W) * CS, y = Math.floor(k / W) * CS, h = hash(k);
     if (c === GOLD) {
+      ctx.fillStyle='#a66a23';roundRect(x+.5,y+.5,CS-1,CS-1,3);ctx.fill();
       ctx.fillStyle = GOLD_C[(h * 3) | 0];
-      ctx.fillRect(x, y, CS + 0.5, CS + 0.5);
+      roundRect(x+1,y+1,CS-2,CS-3,2);ctx.fill();
       if (((k * 7 + fr) % 53) === 0) { ctx.fillStyle = '#fff'; ctx.fillRect(x + 4, y + 4, 4, 4); }
       else { ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fillRect(x + 2, y + 2, 3, 3); }
     } else if (c === WATER) {
@@ -566,7 +651,7 @@ function drawGrid(now) {
   drawPins(now);
   for (const f of G.fx) {
     ctx.globalAlpha = Math.max(0, f.life) * 0.8;
-    ctx.fillStyle = f.t === 0 ? '#dfe6f0' : '#6b6070';
+    ctx.fillStyle = f.t === 0 ? '#d2fff2' : '#6b6070';
     ctx.beginPath(); ctx.arc(f.x, f.y, 3 + (1 - f.life) * 6, 0, 7); ctx.fill();
   }
   ctx.globalAlpha = 1;
@@ -597,6 +682,7 @@ function drawCart(now) {
 }
 
 function moleMood() {
+  if (!G.sim) return 'idle';
   if (G.state === 'fail' || G.state === 'over') return 'sad';
   if (G.state === 'win') return 'happy';
   const g = G.sim.g;
@@ -710,9 +796,10 @@ function drawPins(now) {
       ctx.fillStyle = gr;
       roundRect(gm.cx - 4, gm.a + 1, 8, gm.len - 2, 4); ctx.fill();
     }
+    if(G.hint===i && G.hintLife>0){ctx.strokeStyle='#65ffe0';ctx.lineWidth=3;ctx.shadowColor='#65ffe0';ctx.shadowBlur=18;ctx.beginPath();ctx.arc(gm.hx,gm.hy,17+3*Math.sin(now/160),0,7);ctx.stroke();ctx.shadowBlur=0;}
     ctx.lineWidth = 4; ctx.strokeStyle = '#ffcf33';
-    ctx.fillStyle = '#3a2a10';
-    ctx.beginPath(); ctx.arc(gm.hx, gm.hy, 9, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#183b3d';
+    ctx.beginPath(); ctx.arc(gm.hx, gm.hy, 12, 0, 7); ctx.fill(); ctx.stroke();
     ctx.fillStyle = '#ffe9a0'; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(String(i + 1), gm.hx, gm.hy + 1);
     ctx.restore();
@@ -731,47 +818,39 @@ function heart(x, y, s, on) {
 }
 
 function drawHUD(now) {
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
-  ctx.font = 'bold 22px sans-serif';
-  ctx.fillText('레벨 ' + G.level, 20, 32);
-  for (let i = 0; i < 3; i++) heart(140 + i * 22, 16, 18, i < G.hearts);
-  ctx.textAlign = 'right'; ctx.font = 'bold 18px sans-serif'; ctx.fillStyle = '#ffe07a';
-  ctx.fillText(G.score.toLocaleString() + '점', 380, 30);
-  if (!G.lv || !G.sim) return;
-  const h = goldHome(G.sim.g), tg = G.lv.target;
-  const bx = 20, by = 46, bw = G.lv.time ? 270 : 360, bh = 20;
-  ctx.fillStyle = 'rgba(255,255,255,0.12)'; roundRect(bx, by, bw, bh, 10); ctx.fill();
-  const k = Math.min(1, h / tg);
-  ctx.fillStyle = k >= 1 ? '#7ee081' : '#ffcf33';
-  if (k > 0) { roundRect(bx, by, Math.max(20, bw * k), bh, 10); ctx.fill(); }
-  ctx.fillStyle = '#1b1020'; ctx.textAlign = 'center'; ctx.font = 'bold 13px sans-serif';
-  ctx.fillStyle = k > 0.45 ? '#1b1020' : '#fff';
-  ctx.fillText('금 ' + h + ' / ' + tg, bx + bw / 2, by + 15);
-  if (G.lv.time) {
-    const tl = Math.ceil(G.timeLeft);
-    ctx.fillStyle = tl <= 10 && (now / 250 | 0) % 2 ? '#ff6b6b' : '#fff';
-    ctx.font = 'bold 18px sans-serif'; ctx.textAlign = 'right';
-    ctx.fillText('⏱ ' + tl + '초', 380, 63);
+  ctx.textBaseline='alphabetic';ctx.textAlign='left';ctx.fillStyle='#f7f4de';ctx.font='bold 22px sans-serif';
+  ctx.fillText('광산 '+String(G.level).padStart(2,'0'),20,29);
+  for(let i=0;i<3;i++)heart(157+i*20,13,15,i<G.hearts);
+  ctx.textAlign='right';ctx.fillStyle='#ffda78';ctx.font='bold 18px sans-serif';ctx.fillText(G.score.toLocaleString(),380,28);
+  ctx.font='11px sans-serif';ctx.fillStyle='#91b9b6';ctx.textAlign='left';
+  ctx.fillText(G.lv?.name || (G.level%5===0?'깊은 갱도 · 하트 회복 구간':'더 깊은 곳으로'),21,46);
+  ctx.textAlign='right';ctx.fillText(G.streak>1?'연속 성공 ×'+G.streak:'PIN MINE',379,46);
+  if(!G.lv||!G.sim)return;
+  const h=goldHome(G.sim.g),k=Math.min(1,h/G.lv.target),bw=G.lv.time?274:360;
+  ctx.fillStyle='#06171c';roundRect(20,55,bw,18,9);ctx.fill();
+  if(k){const g=ctx.createLinearGradient(20,0,bw+20,0);g.addColorStop(0,'#e5a534');g.addColorStop(1,k>=1?'#71ebbd':'#ffe28b');ctx.fillStyle=g;roundRect(20,55,Math.max(18,k*bw),18,9);ctx.fill();}
+  ctx.fillStyle=k>.55?'#18322d':'#f6eacd';ctx.textAlign='center';ctx.font='bold 11px sans-serif';ctx.fillText('수집 '+h+' / '+G.lv.target,20+bw/2,68);
+  if(G.lv.time){ctx.fillStyle=G.timeLeft<10?'#ff997a':'#e6efdf';ctx.textAlign='right';ctx.font='bold 14px sans-serif';ctx.fillText(Math.ceil(G.timeLeft)+'초',380,69);}
+}
+const BUTTONS=[{x:20,w:84,label:'↶ 한 수',key:'undo'},{x:112,w:84,label:'✦ 힌트',key:'hint'},{x:204,w:84,label:'↻ 다시',key:'reset'},{x:296,w:84,label:'♪ 소리',key:'sound'}];
+
+
+function drawBottom(now) {
+  for(const b of BUTTONS){
+    const disabled=b.key==='undo'&&!G.history.length;
+    ctx.fillStyle=b.key==='hint'?'#23524f':'#19363d';roundRect(b.x,649,b.w,40,12);ctx.fill();
+    ctx.strokeStyle=b.key==='hint'?'#83c0a855':'#a6c3b522';ctx.lineWidth=1;ctx.stroke();
+    ctx.fillStyle=disabled?'#69858a':'#f5e9c8';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='bold 13px sans-serif';
+    ctx.fillText(b.key==='sound'&&muted?'♪ 꺼짐':b.label,b.x+b.w/2,670);
   }
+  ctx.textAlign='center';ctx.font='11px sans-serif';ctx.fillStyle='#9cbbb6';
+  ctx.fillText(G.toastLife>0?G.toast:(G.sim.still>250?'막혔다면 한 수 되돌리거나 힌트를 보세요':'금은 수레로 · 물 + 용암 = 돌 · Z 되돌리기'),200,706);
 }
 
-const BTN = { x: 20, y: 650, w: 110, h: 50 };
-function drawBottom(now) {
-  // 판이 멈췄는데 아직 못 깼다면 다시 버튼을 깜빡여 알려 준다
-  const stuck = G.state === 'play' && G.sim.still > TPS * 5;
-  ctx.fillStyle = stuck ? 'rgba(255,207,51,' + (0.25 + 0.2 * Math.sin(now / 160)) + ')' : 'rgba(255,255,255,0.1)';
-  roundRect(BTN.x, BTN.y, BTN.w, BTN.h, 14); ctx.fill();
-  ctx.fillStyle = '#fff'; ctx.font = 'bold 18px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText('↺ 다시', BTN.x + BTN.w / 2, BTN.y + BTN.h / 2 + 1);
-  ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = '13px sans-serif'; ctx.textAlign = 'left';
-  ctx.fillText('핀을 탭해서 뽑기', 150, 667);
-  ctx.fillText('용암은 물로 식혀 돌로!', 150, 687);
-}
 
 function panel(title, lines, btn, color = '#ffcf33') {
   ctx.fillStyle = 'rgba(10,6,18,0.72)'; ctx.fillRect(0, 0, VW, VH);
-  ctx.fillStyle = '#2a1d3f'; roundRect(40, 210, 320, 300, 22); ctx.fill();
+  ctx.fillStyle = '#163c40'; roundRect(30, 200, 340, 320, 24); ctx.fill();
   ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.stroke();
   ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
   ctx.fillStyle = color; ctx.font = 'bold 32px sans-serif'; ctx.fillText(title, 200, 266);
@@ -792,31 +871,27 @@ function star(x, y, r, on) {
 }
 
 function drawTitle(now) {
-  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
-  ctx.fillStyle = '#ffcf33'; ctx.font = 'bold 44px sans-serif';
-  ctx.fillText('금광 두더지', 200, 170);
-  ctx.fillStyle = '#c8b6e8'; ctx.font = 'bold 18px sans-serif';
-  ctx.fillText('PIN MINE', 200, 202);
-  // 장식: 금 더미와 핀
-  for (let i = 0; i < 40; i++) {
-    const x = 120 + (i % 10) * 16, y = 300 - Math.floor(i / 10) * 12 + Math.abs((i % 10) - 4.5) * 4;
-    ctx.fillStyle = GOLD_C[i % 3]; ctx.fillRect(x, y, 15, 11);
+  ctx.textAlign='center';ctx.textBaseline='alphabetic';
+  ctx.fillStyle='#7cbdad';ctx.font='bold 12px sans-serif';ctx.fillText('작은 광부의 커다란 한 수',200,104);
+  ctx.shadowColor='#0008';ctx.shadowBlur=15;ctx.shadowOffsetY=5;
+  ctx.fillStyle='#ffe5a0';ctx.font='900 43px sans-serif';ctx.fillText('금광 두더지',200,160);ctx.shadowBlur=0;ctx.shadowOffsetY=0;
+  ctx.font='bold 12px sans-serif';ctx.fillStyle='#9cbdac';ctx.fillText('P I N   M I N E',200,188);
+  ctx.save();ctx.translate(200,309);ctx.rotate(-.08);ctx.fillStyle='#112c30';roundRect(-111,-85,222,180,28);ctx.fill();ctx.strokeStyle='#91c0a733';ctx.lineWidth=2;ctx.stroke();ctx.restore();
+  // Enlarged original vector mascot; no image downloads or font dependency.
+  ctx.save();ctx.translate(200,305);ctx.scale(2.6,2.6);ctx.translate(-(3.5*CS+2),-42*CS);drawMole(now);ctx.restore();
+  for(let i=0;i<9;i++){
+    const x=112+(i%5)*35,y=393-Math.floor(i/5)*22+Math.sin(now/600+i)*2;
+    ctx.fillStyle=i%2?'#efb941':'#ffda75';roundRect(x,y,30,18,4);ctx.fill();ctx.fillStyle='#fff2c0';ctx.fillRect(x+4,y+3,20,3);
   }
-  ctx.fillStyle = '#c0c8d6'; roundRect(100, 322, 200, 9, 4); ctx.fill();
-  ctx.lineWidth = 4; ctx.strokeStyle = '#ffcf33'; ctx.beginPath(); ctx.arc(310, 326, 10, 0, 7); ctx.stroke();
-  ctx.fillStyle = '#fff'; ctx.font = '17px sans-serif';
-  ['핀을 뽑아 금을 수레에 담으세요.', '용암이 수레에 닿으면 실패!', '물을 부으면 용암이 돌로 굳어요.', '금이 용암에 닿으면 재가 돼요.'].forEach((l, i) => ctx.fillText(l, 200, 390 + i * 28));
-  ctx.fillStyle = '#ffcf33'; roundRect(100, 520, 200, 60, 30); ctx.fill();
-  ctx.fillStyle = '#1b1020'; ctx.font = 'bold 22px sans-serif'; ctx.textBaseline = 'middle';
-  ctx.fillText('▶ 시작', 200, 551);
-  ctx.textBaseline = 'alphabetic';
-  if (best.level) {
-    ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.font = '14px sans-serif';
-    ctx.fillText('최고 기록: 레벨 ' + best.level + ' · ' + (best.score || 0).toLocaleString() + '점', 200, 618);
-  }
-  ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.font = '12px sans-serif';
-  ctx.fillText('PC: 숫자키로 핀 뽑기 · R 다시 · Enter 확인', 200, 690);
+  ctx.fillStyle='#d0e2d5';ctx.font='bold 18px sans-serif';ctx.fillText('한 번의 선택, 쏟아지는 황금!',200,458);
+  ctx.font='13px sans-serif';ctx.fillStyle='#95b7b4';ctx.fillText('핀을 뽑고 · 용암을 식히고 · 금을 구하세요',200,485);
+  const g=ctx.createLinearGradient(0,520,0,580);g.addColorStop(0,'#ffe099');g.addColorStop(1,'#edb83e');ctx.fillStyle=g;roundRect(72,520,256,60,18);ctx.fill();
+  ctx.fillStyle='#283b2f';ctx.font='bold 21px sans-serif';ctx.textBaseline='middle';ctx.fillText('광산으로 출발  →',200,550);
+  ctx.font='12px sans-serif';ctx.fillStyle='#97b9b0';ctx.fillText('실수해도 괜찮아요. 한 수 되돌리기 & 힌트',200,609);
+  if(best.level){ctx.fillStyle='#d9c287';ctx.fillText('최고 광산 '+best.level+' · '+(best.score||0).toLocaleString()+'점',200,644);}
+  ctx.fillStyle='#647f80';ctx.font='11px sans-serif';ctx.fillText('숫자키 핀 뽑기 · Z 되돌리기 · H 힌트 · R 다시',200,691);
 }
+
 
 function render(now) {
   ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
@@ -836,14 +911,15 @@ function render(now) {
   drawGrid(now);
   drawBottom(now);
   ctx.restore();
+  for(const f of G.spark){ctx.globalAlpha=Math.max(0,f.life);ctx.fillStyle=f.color;ctx.save();ctx.translate(f.x,f.y);ctx.rotate(f.life*6);ctx.fillRect(-2,-2,5,5);ctx.restore();}ctx.globalAlpha=1;
   const since = now - (G.overAt || 0);
   if (G.state === 'win' && since > 500) {
-    panel('레벨 클리어!', ['', '+' + G.gain.toLocaleString() + '점', G.bonusHeart ? '하트 1개 회복!' : ''], '다음 레벨 ▶', '#7ee081');
+    panel('레벨 클리어!', ['', '+' + G.gain.toLocaleString() + '점', G.bonusHeart ? '하트 1개 회복!' : G.reward ? '연속 '+G.streak+'회! +'+G.reward+' 보너스' : G.assisted?'다음에는 도움 없이 도전!':'완벽한 한 수를 향해!' ], '다음 레벨 ▶', '#7ee081');
     for (let i = 0; i < 3; i++) star(140 + i * 60, 300, 22, i < G.stars);
   } else if (G.state === 'fail' && since > 600) {
-    panel('실패', [G.msg, '남은 하트 ' + G.hearts + '개'], '다시 도전', '#ff8a5c');
+    panel('실패', [G.msg, '남은 하트 ' + G.hearts + '개', G.history.length?'↶ 한 수 되돌리기 (Z / 여기를 탭)':'다른 핀 순서를 생각해 보세요'], '다시 도전', '#ff8a5c');
   } else if (G.state === 'over' && since > 600) {
-    panel('게임 오버', [G.msg, '레벨 ' + G.level + ' · ' + G.score.toLocaleString() + '점', '최고: 레벨 ' + best.level + ' · ' + best.score.toLocaleString() + '점'], '처음부터', '#ff6b6b');
+    panel('게임 오버', [G.msg, '광산 ' + G.level + ' · ' + G.score.toLocaleString() + '점', G.history.length?'↶ 한 수 되돌리기 (Z / 여기를 탭)':'최고 '+best.score.toLocaleString()+'점'], '처음부터', '#ff6b6b');
   }
 }
 
@@ -883,15 +959,18 @@ cv.addEventListener('pointerdown', e => {
   e.preventDefault();
   audio();
   const p = toLogical(e);
+  if(['fail','over'].includes(G.state)&&p.y>=365&&p.y<=405&&G.history.length){undoMove();return;}
   if (G.state !== 'play') { confirmOverlay(); return; }
-  if (p.x >= BTN.x && p.x <= BTN.x + BTN.w && p.y >= BTN.y && p.y <= BTN.y + BTN.h) { resetLevel(); return; }
+  if(p.y>=649&&p.y<=689){const b=BUTTONS.find(b=>p.x>=b.x&&p.x<=b.x+b.w);if(b){if(b.key==='undo')undoMove();if(b.key==='hint')showHint();if(b.key==='reset')resetLevel();if(b.key==='sound')muted=!muted;return;}}
   const i = pinAt(p.x, p.y);
   if (i >= 0) pullPin(i);
 });
 addEventListener('keydown', e => {
   audio();
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); confirmOverlay(); return; }
+  if(e.key.toLowerCase()==='z'){undoMove();return;}
   if (G.state !== 'play') return;
+  if(e.key.toLowerCase()==='h'){showHint();return;}
   if (e.key === 'r' || e.key === 'R') { resetLevel(); return; }
   const n = parseInt(e.key, 10);
   if (n >= 1 && n <= 9) pullPin(n - 1);
@@ -910,7 +989,7 @@ requestLevel(1);
 
 // 자동 테스트용 접근점
 window.PinMine = {
-  G, params, genLevel, solve, pullPin, startRun, nextLevel, resetLevel, confirmOverlay,
+  G, params, genLevel, solve, pullPin, startRun, nextLevel, resetLevel, confirmOverlay, undoMove, showHint,
   goldHome: () => goldHome(G.sim.g),
   advance: (sec) => { for (let t = 0; t < sec; t += 1 / 60) update(1 / 60); },
 };

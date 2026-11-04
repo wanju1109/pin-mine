@@ -1,0 +1,37 @@
+<!doctype html><meta charset="utf-8"><title>Pin Mine QA</title>
+<style>body{background:#10252a;color:white;font:14px monospace;margin:0;display:flex}iframe{width:400px;height:720px;border:0;flex-shrink:0}pre{white-space:pre-wrap;padding:12px}</style>
+<iframe src="../" allow="autoplay"></iframe><pre id="result">Running…</pre>
+<script>
+const frame=document.querySelector('iframe'),out=document.querySelector('pre');
+const results=[],errors=[];
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+const check=(v,msg)=>{if(!v)throw Error(msg);results.push('PASS '+msg);out.textContent=results.join('\n');};
+frame.onload=async()=>{try{
+ const w=frame.contentWindow;w.addEventListener('error',e=>errors.push(e.message));
+ const p=w.PinMine,g=p.G;p.startRun();
+ const ready=async()=>{for(let i=0;i<1200&&g.state==='gen';i++)await wait(25);check(g.state==='play','level '+g.level+' loaded');};
+ await ready();p.advance(2);p.showHint();check(g.hint===0,'opening hint matches solver');
+ p.pullPin(0);p.advance(1);check(p.undoMove()&&g.pulled[0]===-1,'undo restores pin and grid');
+ p.resetLevel();
+ for(let L=1;L<=12;L++){
+   if(L>1){p.nextLevel();await ready();}
+   const sol=g.lv.sol.slice();
+   for(const i of sol){if(g.state!=='play')break;p.pullPin(i);p.advance(5);}
+   p.advance(8);check(g.state==='win','autoplay '+L+' / gold '+p.goldHome()+' target '+g.lv.target);
+   check(!g.sim.lavaHome,'safe cart '+L);
+   if(L===2)check(g.reward===200,'clean streak bonus');
+ }
+ // Fail intentionally, then undo both the choice and heart loss.
+ g.level=2;p.nextLevel();await ready();p.resetLevel();
+ const hearts=g.hearts;p.pullPin(0);p.advance(5);
+ check(['fail','over'].includes(g.state),'wrong gold-first move fails');
+ check(p.undoMove()&&g.hearts===hearts&&g.state==='play','undo failure restores heart');
+ p.advance(2);p.showHint();check(g.hint===1,'live hint after undo');
+ // Force the final-heart branch via an ordinary lethal move.
+ p.resetLevel();g.hearts=1;p.pullPin(2);p.pullPin(3);p.advance(10);
+ check(g.state==='over','game over at zero hearts');g.overAt=-1e9;p.confirmOverlay();await ready();
+ check(g.level===1&&g.hearts===3,'restart after game over');
+ await wait(500);check(errors.length===0,'no browser runtime errors');
+ out.textContent+='\nDONE';document.title='PASS — Pin Mine QA';
+ }catch(e){out.textContent+='\nFAIL '+e.stack;document.title='FAIL — Pin Mine QA';}}
+</script>
